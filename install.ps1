@@ -295,7 +295,7 @@ function Get-StdGitPath {
 }
 
 # Ensure $PathToAdd is inserted before any PATH entry that contains "git" (case-insensitive)
-# Updates Machine (system) PATH; if not elevated, emits a prominent error with instructions
+# on the current User's PATH. Machine (system) PATH is intentionally not touched.
 function Set-PathPrependBeforeGit {
     param(
         [Parameter(Mandatory = $true)][string]$PathToAdd
@@ -350,37 +350,6 @@ function Set-PathPrependBeforeGit {
         $userStatus = 'Error'
     }
 
-    # Try to update Machine PATH
-    $machineStatus = 'Skipped'
-    try {
-        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-        $newMachinePath = BuildPathWithInsert -existingPath $machinePath -toInsert $PathToAdd
-        if ($newMachinePath -ne $machinePath) {
-            [Environment]::SetEnvironmentVariable('Path', $newMachinePath, 'Machine')
-            $machineStatus = 'Updated'
-        } else {
-            # Nothing changed at Machine scope; still treat as Machine for reporting
-            $machineStatus = 'AlreadyPresent'
-        }
-    } catch {
-        # Access denied or not elevated; do NOT modify User PATH. Print big red error with instructions.
-        $origGit = $null
-        try { $origGit = Get-StdGitPath } catch { }
-        $origGitDir = if ($origGit) { (Split-Path $origGit -Parent) } else { 'your Git installation directory' }
-        Write-Host ''
-        Write-Host 'ERROR: Unable to update the SYSTEM PATH (administrator rights required).' -ForegroundColor Red
-        Write-Host 'Your PATH was NOT changed. To ensure git-ai takes precedence over Git:' -ForegroundColor Red
-        Write-Host ("  1) Run PowerShell as Administrator and re-run this installer; OR") -ForegroundColor Red
-        Write-Host ("  2) Manually edit the SYSTEM Path and move '{0}' before any entries containing 'Git' (e.g. '{1}')." -f $PathToAdd, $origGitDir) -ForegroundColor Red
-        Write-Host "     Steps: Start -> type 'Environment Variables' -> 'Edit the system environment variables' -> Environment Variables ->" -ForegroundColor Red
-        Write-Host ("            Under 'System variables', select 'Path' -> Edit -> Move '{0}' to the top (before Git) -> OK." -f $PathToAdd) -ForegroundColor Red
-        Write-Host ''
-        if ($userStatus -eq 'Updated' -or $userStatus -eq 'AlreadyPresent') {
-            Write-Host 'User PATH was updated successfully, so git-ai will still take precedence for this account.' -ForegroundColor Yellow
-        }
-        $machineStatus = 'Error'
-    }
-
     # Update current process PATH immediately for this session
     try {
         $procPath = $env:PATH
@@ -389,8 +358,7 @@ function Set-PathPrependBeforeGit {
     } catch { }
 
     return [PSCustomObject]@{
-        UserStatus    = $userStatus
-        MachineStatus = $machineStatus
+        UserStatus = $userStatus
     }
 }
 
@@ -445,8 +413,7 @@ function Set-PathEnsureContains {
     } catch { }
 
     return [PSCustomObject]@{
-        UserStatus    = $userStatus
-        MachineStatus = 'Skipped'
+        UserStatus = $userStatus
     }
 }
 
@@ -622,16 +589,15 @@ try {
 # Best-effort restart only for daemon-initiated self-updates.
 Start-DaemonIfRequested
 
-# Update PATH. For existing-wrapper users, prepend before any Git entry so the
-# git.exe shim shadows real git. For new users (no wrapper), just ensure our
-# install dir is on User PATH so `git-ai` is discoverable — no positioning,
-# no Machine PATH, no admin needed.
+# Update PATH. For existing-wrapper users, prepend before any Git entry on the
+# User PATH so the git.exe shim shadows real git. For new users (no wrapper),
+# just ensure our install dir is on User PATH so `git-ai` is discoverable.
+# Machine (system) PATH is never touched — no admin required either way.
 $skipPathUpdate = $env:GIT_AI_SKIP_PATH_UPDATE -eq '1'
 if ($skipPathUpdate) {
     Write-Warning 'Skipping PATH updates because GIT_AI_SKIP_PATH_UPDATE=1'
     $pathUpdate = [PSCustomObject]@{
-        UserStatus    = 'Skipped'
-        MachineStatus = 'Skipped'
+        UserStatus = 'Skipped'
     }
 } elseif ($existingWrapper) {
     $pathUpdate = Set-PathPrependBeforeGit -PathToAdd $installDir
@@ -644,14 +610,6 @@ if ($pathUpdate.UserStatus -eq 'Updated') {
     Write-Success 'git-ai already present in the user PATH.'
 } elseif ($pathUpdate.UserStatus -eq 'Error') {
     Write-Host 'Failed to update the user PATH.' -ForegroundColor Red
-}
-
-if ($pathUpdate.MachineStatus -eq 'Updated') {
-    Write-Success 'Successfully added git-ai to the system PATH.'
-} elseif ($pathUpdate.MachineStatus -eq 'AlreadyPresent') {
-    Write-Success 'git-ai already present in the system PATH.'
-} elseif ($pathUpdate.MachineStatus -eq 'Error') {
-    Write-Host 'PATH update failed: system PATH unchanged.' -ForegroundColor Red
 }
 
 Write-Success "Successfully installed git-ai into $installDir"
