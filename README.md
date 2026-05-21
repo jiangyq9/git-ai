@@ -10,8 +10,12 @@ Once installed, it automatically links every AI-written line to the agent, model
 **AI attribution on every commit:**
 
 `git commit`
+
 ```
 [hooks-doctor 0afe44b2] wsl compat check
+
+> git ai stats
+
  2 files changed, 81 insertions(+), 3 deletions(-)
 you  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ai
      6%             mixed   2%             92%
@@ -19,7 +23,7 @@ you  ██░░░░░░░░░░░░░░░░░░░░░░░
 
 **AI Blame shows the model, agent, and session behind every line:**
 
-`git-ai blame /src/log_fmt/authorship_log.rs`
+`git ai blame /src/log_fmt/authorship_log.rs`
 ```bash
 
 cb832b7 (Aidan Cunniffe      2025-12-13 08:16:29 -0500  133) pub fn execute_diff(
@@ -125,7 +129,7 @@ That's it — **no per-repo setup required.** Prompt and commit as normal. Git A
 Line-level AI-attribution let you track AI-code through the full SDLC. Track how much AI code gets accepted, committed, through code review, and into production — to identify which tools and practices work best.
 
 ```bash
-git-ai stats --json
+git ai stats --json
 git ai stats <start_sha>..<end_sha> --json
 ```
 
@@ -158,7 +162,7 @@ Calculates % AI-code, AI-lines generated vs committed, accepted rates, human ove
 Git AI blame is a drop-in replacement for `git blame` that shows AI attribution for each line. It supports [all standard `git blame` flags](https://git-scm.com/docs/git-blame).
 
 ```bash
-git-ai blame /src/log_fmt/authorship_log.rs
+git ai blame /src/log_fmt/authorship_log.rs
 ```
 
 ```bash
