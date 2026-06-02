@@ -1457,6 +1457,134 @@ fn test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main() {
     );
 }
 
+/// Production-path (`git-ai ci local merge`) variant of the #1473 regression.
+///
+/// Drives the exact entrypoint a GitHub Actions workflow invokes (the "CI merge
+/// rewrite action" named in the issue) instead of calling `CiContext`
+/// in-process. Same topology: a linear `main` with note-less teammate commits
+/// (raw `git`, simulating contributors not yet using the wrapper) and a
+/// 3-commit AI PR squashed on top. Only the squash commit may receive an
+/// authorship note; the unrelated base commits must stay untouched.
+#[test]
+fn test_ci_local_merge_squash_on_linear_main_does_not_note_base_commits() {
+    let repo = direct_test_repo();
+    repo.git_og(&["config", "user.name", "Test User"]).unwrap();
+    repo.git_og(&["config", "user.email", "test@example.com"])
+        .unwrap();
+
+    // B0: initial commit on main (raw git -> no authorship note)
+    std::fs::write(repo.path().join("base.txt"), "base content\n").unwrap();
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "B0 initial"]).unwrap();
+    repo.git_og(&["branch", "-M", "main"]).unwrap();
+    let b0_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // B1, B2, B3: teammate commits on main, NOT using the wrapper (no notes)
+    for i in 1..=3 {
+        std::fs::write(
+            repo.path().join(format!("teammate{i}.txt")),
+            format!("teammate change {i}\n"),
+        )
+        .unwrap();
+        repo.git_og(&["add", "-A"]).unwrap();
+        repo.git_og(&["commit", "-m", &format!("B{i} teammate change")])
+            .unwrap();
+    }
+    let b2_sha = repo
+        .git_og(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let b3_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // feature branch off B0 with 3 AI commits (each gets a note via the wrapper)
+    repo.git_og(&["checkout", "-b", "feature", &b0_sha]).unwrap();
+    let mut feat = repo.filename("feature.txt");
+    feat.set_contents(crate::lines!["// P1 ai line".ai()]);
+    repo.stage_all_and_commit("P1").unwrap();
+    feat.insert_at(1, crate::lines!["// P2 ai line".ai()]);
+    repo.stage_all_and_commit("P2").unwrap();
+    feat.insert_at(2, crate::lines!["// P3 ai line".ai()]);
+    let head_sha = repo.stage_all_and_commit("P3").unwrap().commit_sha;
+
+    // Squash merge: GitHub creates one new commit S on top of B3 (raw git)
+    repo.git_og(&["checkout", "main"]).unwrap();
+    std::fs::write(
+        repo.path().join("feature.txt"),
+        "// P1 ai line\n// P2 ai line\n// P3 ai line\n",
+    )
+    .unwrap();
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "Squash merge feature (#PR)"])
+        .unwrap();
+    let squash_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Bare origin so `ci local merge` can push authorship
+    let origin_dir = tempfile::tempdir().unwrap();
+    let origin_path = origin_dir.path().join("origin.git");
+    repo.git_og(&[
+        "clone",
+        "--bare",
+        repo.path().to_str().unwrap(),
+        origin_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    repo.git_og(&["remote", "add", "origin", origin_path.to_str().unwrap()])
+        .unwrap();
+
+    // Run the real CLI exactly as CI would after a squash merge
+    let output = repo
+        .git_ai(&[
+            "ci",
+            "local",
+            "merge",
+            "--merge-commit-sha",
+            squash_sha.as_str(),
+            "--head-ref",
+            "feature",
+            "--head-sha",
+            head_sha.as_str(),
+            "--base-ref",
+            "main",
+            "--base-sha",
+            b3_sha.as_str(),
+            "--skip-fetch-notes",
+            "--skip-fetch-base",
+        ])
+        .expect("ci local merge should succeed");
+
+    assert!(
+        output.contains("authorship rewritten successfully"),
+        "expected authorship rewritten, got: {output}"
+    );
+
+    // Only the squash commit S carries a note; the base commits are untouched.
+    assert!(
+        repo.read_authorship_note(&squash_sha).is_some(),
+        "squash commit S ({squash_sha}) should receive the rewritten authorship note"
+    );
+    assert!(
+        repo.read_authorship_note(&b2_sha).is_none(),
+        "#1473 regression: unrelated base commit B2 ({b2_sha}) must not receive a note"
+    );
+    assert!(
+        repo.read_authorship_note(&b3_sha).is_none(),
+        "#1473 regression: unrelated base commit B3 ({b3_sha}) must not receive a note"
+    );
+}
+
 crate::reuse_tests_in_worktree!(
     test_ci_squash_merge_basic,
     test_ci_squash_merge_multiple_files,
@@ -1473,4 +1601,5 @@ crate::reuse_tests_in_worktree!(
     test_ci_squash_merge_with_manual_changes_standard_human,
     test_ci_rebase_merge_multiple_commits_standard_human,
     test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main,
+    test_ci_local_merge_squash_on_linear_main_does_not_note_base_commits,
 );
