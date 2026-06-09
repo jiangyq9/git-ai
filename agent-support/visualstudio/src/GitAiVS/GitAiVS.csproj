@@ -9,6 +9,7 @@
     <Nullable>enable</Nullable>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <InternalsVisibleTo>GitAiVS.Tests</InternalsVisibleTo>
   </PropertyGroup>
 
   <!-- VSIX support -->

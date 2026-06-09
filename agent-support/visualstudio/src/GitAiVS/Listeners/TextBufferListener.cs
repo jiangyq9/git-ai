@@ -17,31 +17,11 @@ using Microsoft.VisualStudio.Utilities;
 namespace GitAiVS.Listeners
 {
     /// <summary>
-    /// Tracks which files were recently touched by an AI agent.
-    /// </summary>
-    internal sealed class TrackedAgent
-    {
-        public const long StaleThresholdMs = 300_000;
-        public const long RefreshEligibilityWindowMs = 15_000;
-
-        public string AgentName { get; }
-        public string WorkspaceRoot { get; }
-        public string LastCheckpointContent { get; }
-        public long TrackedAt { get; }
-
-        public TrackedAgent(string agentName, string workspaceRoot, string lastCheckpointContent, long trackedAt)
-        {
-            AgentName = agentName;
-            WorkspaceRoot = workspaceRoot;
-            LastCheckpointContent = lastCheckpointContent;
-            TrackedAt = trackedAt;
-        }
-    }
-
-    /// <summary>
     /// Attaches to every opened text editor in Visual Studio and listens for
     /// ITextBuffer.Changed events. Uses stack trace analysis to detect AI edits
-    /// and dispatches checkpoints accordingly.
+    /// and dispatches before_edit (human) and after_edit (ai_agent) checkpoints.
+    ///
+    /// Modeled after IntelliJ's DocumentChangeListener.kt.
     /// </summary>
     [Export(typeof(IVsTextViewCreationListener))]
     [ContentType("text")]
@@ -51,11 +31,8 @@ namespace GitAiVS.Listeners
         [Import]
         internal IVsEditorAdaptersFactoryService? AdapterService { get; set; }
 
-        private readonly ConcurrentDictionary<string, TrackedAgent> _agentTouchedFiles = new();
         private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingCheckpoints = new();
-        private readonly ConcurrentDictionary<string, string> _fileContentBeforeEdit = new();
         private readonly ConcurrentDictionary<string, long> _beforeEditTriggered = new();
-        private readonly ConcurrentDictionary<ITextBuffer, TabCompletionFilter> _tabFilters = new();
 
         private const int DebounceMs = 300;
         private const long BeforeEditExpiryMs = 5000;
@@ -70,17 +47,11 @@ namespace GitAiVS.Listeners
             if (textView == null) return;
 
             var buffer = textView.TextBuffer;
-
-            var tabFilter = new TabCompletionFilter();
-            tabFilter.AttachToView(textViewAdapter);
-            _tabFilters[buffer] = tabFilter;
-
             buffer.Changed += OnBufferChanged;
 
             textView.Closed += (_, __) =>
             {
                 buffer.Changed -= OnBufferChanged;
-                _tabFilters.TryRemove(buffer, out TabCompletionFilter _);
             };
         }
 
@@ -97,7 +68,7 @@ namespace GitAiVS.Listeners
             var stackTrace = new StackTrace();
             var analysis = CopilotEditDetector.Analyze(stackTrace);
 
-            LogBufferChange(filePath, e, analysis);
+            LogBufferChange(filePath, analysis);
 
             if (analysis.Confidence != Confidence.High || analysis.AgentName == null)
                 return;
@@ -107,37 +78,29 @@ namespace GitAiVS.Listeners
 
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            SendBeforeEditIfNeeded(filePath, workspaceRoot, analysis.AgentName, buffer, now);
-
-            UpdateTracking(filePath, workspaceRoot, analysis.AgentName, buffer.CurrentSnapshot.GetText(), now);
-
+            SendBeforeEditIfNeeded(filePath, workspaceRoot, analysis.AgentName, e, now);
             ScheduleAfterEditCheckpoint(filePath, workspaceRoot, analysis.AgentName, buffer);
         }
 
-        private void SendBeforeEditIfNeeded(string filePath, string workspaceRoot, string agentName, ITextBuffer buffer, long now)
+        private void SendBeforeEditIfNeeded(string filePath, string workspaceRoot, string agentName, TextContentChangedEventArgs e, long now)
         {
             if (_beforeEditTriggered.TryGetValue(filePath, out var lastTriggered) && (now - lastTriggered) < BeforeEditExpiryMs)
                 return;
 
-            var currentContent = buffer.CurrentSnapshot.GetText();
-            _fileContentBeforeEdit[filePath] = currentContent;
             _beforeEditTriggered[filePath] = now;
 
+            var preEditContent = e.Before.GetText();
             var relativePath = GitRepoResolver.ToRelativePath(filePath, workspaceRoot);
-
-            var dirtyFiles = new Dictionary<string, string> { { relativePath, currentContent } };
+            var dirtyFiles = new Dictionary<string, string> { { relativePath, preEditContent } };
 
             Trace.WriteLine($"[git-ai] Triggering human checkpoint (before edit by {agentName}) on {relativePath}");
 
+#pragma warning disable VSTHRD110
             _ = Task.Run(() => CheckpointSvc!.SendBeforeEditAsync(
                 workspaceRoot,
                 new[] { relativePath },
                 dirtyFiles));
-        }
-
-        private void UpdateTracking(string filePath, string workspaceRoot, string agentName, string content, long now)
-        {
-            _agentTouchedFiles[filePath] = new TrackedAgent(agentName, workspaceRoot, content, now);
+#pragma warning restore VSTHRD110
         }
 
         private void ScheduleAfterEditCheckpoint(string filePath, string workspaceRoot, string agentName, ITextBuffer buffer)
@@ -153,12 +116,10 @@ namespace GitAiVS.Listeners
                 if (t.IsCanceled) return;
 
                 _pendingCheckpoints.TryRemove(filePath, out CancellationTokenSource _);
-                _fileContentBeforeEdit.TryRemove(filePath, out string _);
                 _beforeEditTriggered.TryRemove(filePath, out long _);
 
                 var contentAfterEdit = buffer.CurrentSnapshot.GetText();
                 var relativePath = GitRepoResolver.ToRelativePath(filePath, workspaceRoot);
-
                 var dirtyFiles = new Dictionary<string, string> { { relativePath, contentAfterEdit } };
 
                 Trace.WriteLine($"[git-ai] Triggering ai_agent checkpoint for {agentName} on {relativePath}");
@@ -181,14 +142,13 @@ namespace GitAiVS.Listeners
             return null;
         }
 
-        private static void LogBufferChange(string filePath, TextContentChangedEventArgs e, AnalysisResult analysis)
+        private static void LogBufferChange(string filePath, AnalysisResult analysis)
         {
-            if (analysis.AgentName != null)
-            {
-                Trace.WriteLine($"[git-ai] Buffer change detected on {Path.GetFileName(filePath)}");
-                Trace.WriteLine($"[git-ai]   Source: {analysis.AgentName} (confidence: {analysis.Confidence})");
-                Trace.WriteLine($"[git-ai]   Relevant frames:\n{CopilotEditDetector.FormatRelevantFrames(analysis.RelevantFrames)}");
-            }
+            if (analysis.AgentName == null) return;
+
+            Trace.WriteLine($"[git-ai] Buffer change detected on {Path.GetFileName(filePath)}");
+            Trace.WriteLine($"[git-ai]   Source: {analysis.AgentName} (confidence: {analysis.Confidence})");
+            Trace.WriteLine($"[git-ai]   Relevant frames:\n{CopilotEditDetector.FormatRelevantFrames(analysis.RelevantFrames)}");
         }
     }
 }

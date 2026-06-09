@@ -12,10 +12,10 @@ namespace GitAiVS
 {
     /// <summary>
     /// The main package entry point for the git-ai Visual Studio extension.
-    /// 
+    ///
     /// Responsibilities:
     ///   - Resolve the git-ai binary on startup
-    ///   - Wire CheckpointService into the TextBufferListener (MEF-exported)
+    ///   - Set CheckpointService.Current for MEF-exported listeners
     ///   - Subscribe to Running Document Table events for save-based known_human checkpoints
     ///   - Show an info bar if git-ai is not installed
     /// </summary>
@@ -27,7 +27,8 @@ namespace GitAiVS
     [Guid(PackageGuidString)]
     public sealed class GitAiPackage : AsyncPackage
     {
-        public const string PackageGuidString = "B2C3D4E5-F6A7-8901-BCDE-F12345678901";
+        public const string PackageGuidString = "2255BC5C-824C-4BAD-A785-AF360545E256";
+        private const string ExtensionVersion = "0.1.0";
 
         private BinaryResolver? _binaryResolver;
         private CheckpointService? _checkpointService;
@@ -38,29 +39,26 @@ namespace GitAiVS
         {
             try
             {
-            await base.InitializeAsync(cancellationToken, progress);
-            await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
+                await base.InitializeAsync(cancellationToken, progress);
+                await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
 
-            System.Diagnostics.Trace.WriteLine("[git-ai] GitAiPackage initializing...");
+                System.Diagnostics.Trace.WriteLine("[git-ai] GitAiPackage initializing...");
 
-            _binaryResolver = new BinaryResolver();
-            var binaryPath = _binaryResolver.Resolve();
+                _binaryResolver = new BinaryResolver();
+                var binaryPath = _binaryResolver.Resolve();
 
-            if (binaryPath == null)
-            {
-                System.Diagnostics.Trace.WriteLine("[git-ai] git-ai binary not found. Extension will be inactive.");
-                ShowInfoBar("git-ai is not installed. Visit https://usegitai.com to install it.");
-                return;
-            }
+                if (binaryPath == null)
+                {
+                    ShowInfoBar("git-ai is not installed. Visit https://usegitai.com to install it.");
+                    return;
+                }
 
-            System.Diagnostics.Trace.WriteLine($"[git-ai] Found git-ai at {binaryPath} (version {_binaryResolver.ResolvedVersion})");
+                _checkpointService = new CheckpointService(_binaryResolver);
+                CheckpointService.Current = _checkpointService;
 
-            _checkpointService = new CheckpointService(_binaryResolver);
-            CheckpointService.Current = _checkpointService;
+                SubscribeToSaveEvents();
 
-            SubscribeToSaveEvents();
-
-            System.Diagnostics.Trace.WriteLine("[git-ai] GitAiPackage initialized successfully.");
+                System.Diagnostics.Trace.WriteLine("[git-ai] GitAiPackage initialized successfully.");
             }
             catch (Exception ex)
             {
@@ -68,9 +66,6 @@ namespace GitAiVS
             }
         }
 
-        /// <summary>
-        /// Subscribe to the Running Document Table to get save events.
-        /// </summary>
         private void SubscribeToSaveEvents()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -83,9 +78,7 @@ namespace GitAiVS
             }
 
             var vsVersion = GetVisualStudioVersion();
-            const string extensionVersion = "0.1.0";
-
-            _saveListener = new DocumentSaveListener(_checkpointService!, vsVersion, extensionVersion);
+            _saveListener = new DocumentSaveListener(_checkpointService!, vsVersion, ExtensionVersion);
 
             var rdtEvents = new RdtSaveEventSink(_saveListener, rdt);
             rdt.AdviseRunningDocTableEvents(rdtEvents, out _rdtCookie);
@@ -180,7 +173,6 @@ namespace GitAiVS
             return path;
         }
 
-        // Required interface members — all no-ops except OnAfterSave
         public int OnAfterFirstDocumentLock(uint docCookie, uint dwRDTLockType, uint dwReadLocksRemaining, uint dwEditLocksRemaining) => VSConstants.S_OK;
         public int OnBeforeLastDocumentUnlock(uint docCookie, uint dwRDTLockType, uint dwReadLocksRemaining, uint dwEditLocksRemaining) => VSConstants.S_OK;
         public int OnAfterAttributeChange(uint docCookie, uint grfAttribs) => VSConstants.S_OK;

@@ -1,4 +1,6 @@
+using System;
 using System.IO;
+using System.Runtime.InteropServices;
 
 namespace GitAiVS.Services
 {
@@ -8,6 +10,11 @@ namespace GitAiVS.Services
     /// </summary>
     public static class GitRepoResolver
     {
+        private static readonly StringComparison PathComparison =
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+
         public static string? FindRepoRoot(string filePath)
         {
             var dir = Path.GetDirectoryName(filePath);
@@ -25,10 +32,11 @@ namespace GitAiVS.Services
 
         /// <summary>
         /// Convert an absolute file path to a path relative to the workspace root.
+        /// Uses case-insensitive comparison on Windows to handle path casing mismatches.
         /// </summary>
-        public static string ToRelativePath(string absolutePath, string workspaceRoot)
+        internal static string ToRelativePath(string absolutePath, string workspaceRoot)
         {
-            if (absolutePath.StartsWith(workspaceRoot))
+            if (absolutePath.StartsWith(workspaceRoot, PathComparison))
             {
                 var relative = absolutePath.Substring(workspaceRoot.Length);
                 return relative.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

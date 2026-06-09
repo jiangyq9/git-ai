@@ -127,24 +127,6 @@ namespace GitAiVS.Detection
             return new AnalysisResult(detectedAgent, confidence, relevantFrames);
         }
 
-        /// <summary>
-        /// Format a stack trace for debug logging.
-        /// </summary>
-        public static string FormatStackTrace(StackTrace stackTrace, int maxFrames = 50)
-        {
-            var lines = new List<string>();
-            for (int i = 0; i < System.Math.Min(stackTrace.FrameCount, maxFrames); i++)
-            {
-                var frame = stackTrace.GetFrame(i);
-                var method = frame?.GetMethod();
-                if (method?.DeclaringType == null) continue;
-
-                lines.Add($"  at {method.DeclaringType.FullName}.{method.Name}");
-            }
-
-            return string.Join("\n", lines);
-        }
-
         public static string FormatRelevantFrames(IReadOnlyList<StackFrame> frames)
         {
             if (frames.Count == 0)

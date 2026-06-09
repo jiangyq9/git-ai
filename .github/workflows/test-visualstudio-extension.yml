@@ -1,0 +1,57 @@
+name: Visual Studio Extension Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent-support/visualstudio/**'
+  pull_request:
+    paths:
+      - 'agent-support/visualstudio/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: agent-support/visualstudio
+
+jobs:
+
+  build:
+    name: Build
+    runs-on: windows-latest
+    steps:
+      - name: Fetch Sources
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/GitAiVS/GitAiVS.csproj
+
+      - name: Build extension
+        run: dotnet build src/GitAiVS/GitAiVS.csproj --no-restore --configuration Release
+
+  test:
+    name: Test
+    needs: [build]
+    runs-on: windows-latest
+    steps:
+      - name: Fetch Sources
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run Tests
+        run: dotnet test src/GitAiVS.Tests/GitAiVS.Tests.csproj --verbosity normal

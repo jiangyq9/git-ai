@@ -33,7 +33,7 @@ If a HIGH-confidence match is found, the edit is recorded as an AI checkpoint. T
 
 | Listener | Trigger | Checkpoint type |
 |---|---|---|
-| `DocumentChangeListener` | `ITextBuffer.Changed` equivalent | `agent-v1` (AI) with before/after pair |
+| `DocumentChangeListener` | `beforeDocumentChange` / `documentChanged` | `agent-v1` (AI) with before/after pair |
 | `VfsRefreshListener` | Disk writes from external processes | `agent-v1` (AI) sweep checkpoint |
 | `DocumentSaveListener` | User-initiated saves | `known_human` |
 
@@ -70,7 +70,6 @@ Because Visual Studio runs Copilot extensions in-process on the UI thread (like 
 │  │   ├── BinaryResolver │  Locate git-ai binary         │
 │  │   └── Registers:     │                               │
 │  │       ├── TextBufferListener   ──┐                   │
-│  │       ├── TabCompletionFilter  ──┤                   │
 │  │       └── DocumentSaveListener ──┤                   │
 │  └──────────────────────┘           │                   │
 │                                     ▼                   │
@@ -79,6 +78,10 @@ Because Visual Studio runs Copilot extensions in-process on the UI thread (like 
 │  │  Inspects Environment.StackTrace for:        │       │
 │  │   • GitHub.Copilot.*                         │       │
 │  │   • Microsoft.VisualStudio.Copilot.*         │       │
+│  │   • Microsoft.VisualStudio.Editor.           │       │
+│  │     Implementation.Copilot.*                 │       │
+│  │   • Microsoft.VisualStudio.Conversations.    │       │
+│  │     UI.Internal.Copilot.*                    │       │
 │  └──────────────────────────────────────────────┘       │
 │                    │                                     │
 │                    ▼                                     │
@@ -112,14 +115,14 @@ User accepts Copilot suggestion (Tab) or Copilot chat applies edit
 ITextBuffer.Changed fires on UI thread
     │
     ▼
-TextBufferListener captures Environment.StackTrace
+TextBufferListener captures new StackTrace()
     │
     ▼
 CopilotEditDetector.Analyze(stackTrace)
     │
-    ├── HIGH confidence match (Copilot assembly found)
+    ├── HIGH confidence match (Copilot namespace prefix found)
     │   │
-    │   ├── 1. Send "human" before_edit checkpoint (pre-edit content)
+    │   ├── 1. Send "human" before_edit checkpoint (pre-edit content via e.Before)
     │   │      { "type": "human", "repo_working_dir": "...", "will_edit_filepaths": [...], "dirty_files": {...} }
     │   │
     │   └── 2. Debounce 300ms, then send "ai_agent" after_edit checkpoint
@@ -127,7 +130,7 @@ CopilotEditDetector.Analyze(stackTrace)
     │            "agent_name": "github-copilot-visualstudio", "model": "unknown",
     │            "conversation_id": "<session_id>", "dirty_files": {...} }
     │
-    └── No match (human edit)
+    └── No match or MEDIUM confidence (human edit)
         │
         └── On save: send known_human checkpoint (debounced 500ms)
             { "editor": "visualstudio", "editor_version": "17.x", "extension_version": "0.1.0",
@@ -145,27 +148,11 @@ CopilotEditDetector.Analyze(stackTrace)
 The `AsyncPackage` subclass that Visual Studio loads on startup. Responsibilities:
 
 - Resolve the git-ai binary path (via `BinaryResolver`)
-- Register `IVsTextViewCreationListener` (to attach `TextBufferListener` to every editor)
+- Set `CheckpointService.Current` for MEF-exported components to access
 - Subscribe to `IVsRunningDocTableEvents` (for `DocumentSaveListener`)
-- Display info bar if git-ai is not installed
+- Display info bar if git-ai is not installed (currently logs only, UI planned)
 
-```csharp
-[PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
-[ProvideAutoLoad(VSConstants.UICONTEXT.SolutionExists_string, PackageAutoLoadFlags.BackgroundLoad)]
-[Guid(PackageGuidString)]
-public sealed class GitAiPackage : AsyncPackage
-{
-    protected override async Task InitializeAsync(CancellationToken cancellationToken, IProgress<ServiceProgressData> progress)
-    {
-        await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
-        // 1. Resolve binary
-        // 2. Register listeners
-        // 3. Show info bar if binary not found
-    }
-}
-```
-
-**Auto-load context**: `SolutionExists` -- the package loads when any solution is opened, which is the earliest useful point (files are available to edit).
+Auto-load contexts: `NoSolution`, `SolutionExists`, `SolutionHasMultipleProjects`, `SolutionHasSingleProject` -- ensures the package loads regardless of how VS starts.
 
 ### 4.2 BinaryResolver
 
@@ -177,47 +164,13 @@ Locates the `git-ai` (or `git-ai.exe`) binary. Search order:
 2. `%USERPROFILE%\.git-ai-local-dev\gitwrap\bin\git-ai.exe` (nix dev path)
 3. `PATH` lookup via `where git-ai` (Windows) or `which git-ai` (Mac/Linux)
 
-After finding the binary, runs `git-ai version` to verify it meets the minimum version requirement (currently `1.0.23`, matching IntelliJ). Caches the resolved path for the session.
-
-```csharp
-public class BinaryResolver
-{
-    private static readonly Version MinVersion = new(1, 0, 23);
-    private string _cachedPath;
-
-    public string Resolve()
-    {
-        if (_cachedPath != null && File.Exists(_cachedPath)) return _cachedPath;
-
-        // Check known paths, then PATH
-        // Verify version
-        // Cache and return
-    }
-}
-```
+After finding the binary, runs `git-ai version` to verify it meets the minimum version requirement (currently `1.0.23`, matching IntelliJ). Caches the resolved path for the session. Logs structured error messages when the binary is not found or version is too old, matching IntelliJ's `GitAiService.findGitAiBinary()` pattern.
 
 ### 4.3 GitRepoResolver
 
 **File**: `src/GitAiVS/Services/GitRepoResolver.cs`
 
-Finds the git repository root for a given file path by walking up the directory tree looking for a `.git` directory. This is the `repo_working_dir` value sent in every checkpoint.
-
-```csharp
-public static class GitRepoResolver
-{
-    public static string FindRepoRoot(string filePath)
-    {
-        var dir = Path.GetDirectoryName(filePath);
-        while (dir != null)
-        {
-            if (Directory.Exists(Path.Combine(dir, ".git")))
-                return dir;
-            dir = Path.GetDirectoryName(dir);
-        }
-        return null;
-    }
-}
-```
+Finds the git repository root for a given file path by walking up the directory tree looking for a `.git` directory (supports both regular repos and worktrees where `.git` is a file). `ToRelativePath` uses case-insensitive comparison on Windows.
 
 ### 4.4 CopilotEditDetector (stack trace analysis)
 
@@ -227,262 +180,65 @@ The core detection logic, directly modeled after IntelliJ's `StackTraceAnalyzer.
 
 **How it works**: When `ITextBuffer.Changed` fires, the calling thread's stack trace contains frames from whatever code triggered the change. If Copilot triggered it, frames from Copilot's assemblies will be present.
 
-**Known agent patterns**:
+**Discovered namespace prefixes** (empirically verified on VS 2022/2025):
 
-| Agent name | Package/namespace prefixes (HIGH confidence) | Class name patterns (MEDIUM confidence) |
+| Agent name | Namespace prefixes (HIGH confidence) | Class keywords (MEDIUM confidence) |
 |---|---|---|
-| `github-copilot-visualstudio` | `GitHub.Copilot`, `Microsoft.VisualStudio.Copilot` | `copilot` |
+| `github-copilot-visualstudio` | `GitHub.Copilot`, `Microsoft.VisualStudio.Copilot`, `Microsoft.VisualStudio.Editor.Implementation.Copilot`, `Microsoft.VisualStudio.Conversations.UI.Internal.Copilot` | `copilot` |
+
+**Specific stack frames observed**:
+- Inline completions: `Microsoft.VisualStudio.Editor.Implementation.CopilotPreemptingCommandFilter.Exec`
+- Chat edits: `Microsoft.VisualStudio.Conversations.UI.Internal.CopilotBufferUpdater.ApplyEditsAndSaveAsync`
 
 **Confidence levels**:
 
-- **HIGH**: A stack frame's full class name starts with a known package prefix (e.g., `GitHub.Copilot.InlineCompletion.Handler`). Only HIGH-confidence matches trigger checkpoints.
-- **MEDIUM**: A stack frame's class name contains a known keyword (e.g., class name contains `copilot`). Logged for debugging but does not trigger checkpoints.
-- **NONE**: No AI agent patterns detected. The edit is treated as human.
+- **HIGH**: A stack frame's full class name starts with a known namespace prefix. Only HIGH-confidence matches trigger checkpoints.
+- **MEDIUM**: A stack frame's class name contains a known keyword. Logged for debugging but does not trigger checkpoints.
+- **NONE**: No AI agent patterns detected.
 
-```csharp
-public enum Confidence { None, Medium, High }
-
-public record AnalysisResult(string AgentName, Confidence Confidence, List<StackFrame> RelevantFrames);
-
-public static class CopilotEditDetector
-{
-    private static readonly AgentPattern[] KnownAgents = new[]
-    {
-        new AgentPattern(
-            Name: "github-copilot-visualstudio",
-            PackagePrefixes: new[] { "GitHub.Copilot", "Microsoft.VisualStudio.Copilot" },
-            ClassKeywords: new[] { "copilot" }
-        ),
-    };
-
-    public static AnalysisResult Analyze(StackTrace stackTrace)
-    {
-        // Walk frames, match against patterns
-        // Return first HIGH-confidence match, or NONE
-    }
-}
-```
-
-**Important**: The exact namespace prefixes for GitHub Copilot in Visual Studio will need to be discovered empirically by installing Copilot in VS, making edits, and logging the stack traces. The prefixes listed above are our best starting guess based on the extension's known publisher (`GitHub.Copilot`). We will need a discovery phase where we log all stack frames on every text change to identify the exact patterns.
-
-### 4.5 TabCompletionFilter (inline completion detection)
-
-**File**: `src/GitAiVS/Detection/TabCompletionFilter.cs`
-
-Detects when a user accepts an inline Copilot suggestion by pressing Tab.
-
-**Strategy**: Implement `IOleCommandTarget` and attach it as a command filter to the text view. When `VSStd2KCmdID.TAB` is executed and an inline completion adornment is visible, set a short-lived flag (`_tabAcceptedAt`) that `TextBufferListener` checks on the next `ITextBuffer.Changed` event.
-
-```csharp
-public class TabCompletionFilter : IOleCommandTarget
-{
-    private DateTime _tabAcceptedAt = DateTime.MinValue;
-    private static readonly TimeSpan TabWindow = TimeSpan.FromMilliseconds(200);
-
-    public bool WasRecentTabAccept => (DateTime.UtcNow - _tabAcceptedAt) < TabWindow;
-
-    public int Exec(ref Guid pguidCmdGroup, uint nCmdID, uint nCmdexecopt, IntPtr pvaIn, IntPtr pvaOut)
-    {
-        if (pguidCmdGroup == VSConstants.VSStd2K && nCmdID == (uint)VSStd2KCmdID.TAB)
-        {
-            // Check if inline completion is showing
-            // If so, set _tabAcceptedAt = DateTime.UtcNow
-        }
-        return _nextTarget.Exec(ref pguidCmdGroup, nCmdID, nCmdexecopt, pvaIn, pvaOut);
-    }
-}
-```
-
-**Detecting whether an inline completion is visible**: This is the trickiest part. Options:
-1. Check for a Copilot-specific adornment layer on the text view
-2. Check if the `ICompletionSession` (or equivalent) is active
-3. Use the Tab key heuristic: if the stack trace in the subsequent `Changed` event contains Copilot frames, it was an accepted suggestion
-
-We will use option 3 as the primary approach (stack trace on the `Changed` event is sufficient), with the `TabCompletionFilter` as a supplementary signal.
-
-### 4.6 TextBufferListener
+### 4.5 TextBufferListener
 
 **File**: `src/GitAiVS/Listeners/TextBufferListener.cs`
 
-Attaches to every opened text editor and listens for `ITextBuffer.Changed` events.
-
-**Lifecycle**: Implements `IVsTextViewCreationListener` (with `[Export]` MEF attribute). Visual Studio calls `VsTextViewCreated` for every editor that opens. We attach our handler to the `ITextBuffer` associated with that view.
+Attaches to every opened text editor via MEF `[Export(typeof(IVsTextViewCreationListener))]` and listens for `ITextBuffer.Changed` events.
 
 **On each change event**:
 
-1. Capture `Environment.StackTrace` (or `new StackTrace()`)
+1. Capture `new StackTrace()` on the calling thread
 2. Pass to `CopilotEditDetector.Analyze()`
 3. If HIGH confidence AI edit:
-   a. If no recent `before_edit` was sent for this file, send a human `before_edit` checkpoint with the pre-change content
+   a. If no recent `before_edit` was sent for this file (5s expiry), send a human checkpoint with pre-edit content from `e.Before.GetText()`
    b. Cancel any pending debounce timer for this file
-   c. Schedule a new 300ms debounce timer; when it fires, send an `ai_agent` `after_edit` checkpoint
-4. Track the file in `_agentTouchedFiles` (same pattern as IntelliJ's `TrackedAgent`)
+   c. Schedule a new 300ms debounce timer; when it fires, send an `ai_agent` after_edit checkpoint with `buffer.CurrentSnapshot.GetText()`
 
-**Debouncing**: AI edits often arrive as rapid sequences of small changes (e.g., Copilot typing character by character). The 300ms debounce window ensures we send a single checkpoint after the burst completes, with the final file content.
+**Before_edit timing**: Unlike our initial implementation which incorrectly used post-change content, we now use `TextContentChangedEventArgs.Before` which provides the pre-edit snapshot. This matches IntelliJ's `beforeDocumentChange` pattern.
 
-```csharp
-[Export(typeof(IVsTextViewCreationListener))]
-[ContentType("text")]
-[TextViewRole(PredefinedTextViewRoles.Editable)]
-public class TextBufferListener : IVsTextViewCreationListener
-{
-    private readonly ConcurrentDictionary<string, TrackedAgent> _agentTouchedFiles = new();
-    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingCheckpoints = new();
-    private readonly ConcurrentDictionary<string, string> _fileContentBeforeEdit = new();
-
-    public void VsTextViewCreated(IVsTextView textViewAdapter)
-    {
-        // Get ITextBuffer from adapter
-        // Subscribe to Changed event
-        // Attach TabCompletionFilter as command filter
-    }
-
-    private void OnBufferChanged(object sender, TextContentChangedEventArgs e)
-    {
-        var stackTrace = new StackTrace();
-        var analysis = CopilotEditDetector.Analyze(stackTrace);
-
-        if (analysis.Confidence == Confidence.High)
-        {
-            HandleAiEdit(filePath, analysis, e);
-        }
-    }
-}
-```
-
-### 4.7 DocumentSaveListener
+### 4.6 DocumentSaveListener
 
 **File**: `src/GitAiVS/Listeners/DocumentSaveListener.cs`
 
-Listens for file save events and sends `known_human` checkpoints. Modeled after IntelliJ's `DocumentSaveListener.kt`.
+Listens for file save events via `IVsRunningDocTableEvents.OnAfterSave` and sends `known_human` checkpoints. Modeled after IntelliJ's `DocumentSaveListener.kt`.
 
-**Implementation**: Subscribe to `IVsRunningDocTableEvents.OnAfterSave` via the Running Document Table (RDT). On save, debounce for 500ms per workspace root, then batch all saved files into a single `known_human` checkpoint.
+Uses `[SAVE]` log prefix for grep-ability. Debounces 500ms per workspace root. Filters `.vs/` internal paths.
 
-**Filtering**: Skip files inside `.vs/` (Visual Studio's internal directory, equivalent to IntelliJ's `.idea/`).
-
-```csharp
-public class DocumentSaveListener : IVsRunningDocTableEvents
-{
-    private readonly ConcurrentDictionary<string, Timer> _pendingCheckpoints = new();
-    private readonly ConcurrentDictionary<string, HashSet<string>> _pendingPaths = new();
-
-    public int OnAfterSave(uint docCookie)
-    {
-        // Get file path from docCookie
-        // Skip .vs/ internal paths
-        // Find workspace root
-        // Add to pending paths, schedule debounced checkpoint
-    }
-}
-```
-
-### 4.8 CheckpointService
+### 4.7 CheckpointService
 
 **File**: `src/GitAiVS/Services/CheckpointService.cs`
 
-Spawns the `git-ai` CLI process and writes JSON to stdin.
+Spawns the `git-ai` CLI process and writes JSON to stdin. Modeled after IntelliJ's `GitAiService.checkpoint()`:
 
-```csharp
-public class CheckpointService
-{
-    private readonly string _binaryPath;
+- Reads both stdout and stderr separately
+- Logs structured multi-line error blocks on failure (Command, Exit code, Stdout, Stderr)
+- 30s timeout for checkpoint commands
+- Never throws -- returns `bool` for fire-and-forget safety
 
-    // For AI edits (agent-v1 preset)
-    public async Task<bool> SendAgentV1Checkpoint(AgentV1Input input, string workingDirectory)
-    {
-        var json = JsonSerializer.Serialize(input);
-        return await RunCheckpoint(new[] { "checkpoint", "agent-v1", "--hook-input", "stdin" }, json, workingDirectory);
-    }
+Uses a static `Current` singleton pattern so MEF-created `TextBufferListener` can access it without manual wiring.
 
-    // For human edits (known_human preset)
-    public async Task<bool> SendKnownHumanCheckpoint(KnownHumanInput input, string workingDirectory)
-    {
-        var json = JsonSerializer.Serialize(input);
-        return await RunCheckpoint(new[] { "checkpoint", "known_human", "--hook-input", "stdin" }, json, workingDirectory);
-    }
-
-    private async Task<bool> RunCheckpoint(string[] args, string stdinJson, string cwd)
-    {
-        var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = _binaryPath,
-                Arguments = string.Join(" ", args),
-                WorkingDirectory = cwd,
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            }
-        };
-
-        process.Start();
-        await process.StandardInput.WriteAsync(stdinJson);
-        process.StandardInput.Close();
-
-        var completed = process.WaitForExit(30_000); // 30s timeout
-        if (!completed)
-        {
-            process.Kill();
-            return false;
-        }
-
-        return process.ExitCode == 0;
-    }
-}
-```
-
-### 4.9 JSON models (checkpoint input schemas)
+### 4.8 JSON models (checkpoint input schemas)
 
 **File**: `src/GitAiVS/Models/CheckpointInput.cs`
 
-These match the Rust `AgentV1Payload` enum (from `agent_v1.rs`) and `KnownHumanPreset` exactly.
-
-#### agent-v1: Human (before_edit)
-
-```json
-{
-  "type": "human",
-  "repo_working_dir": "/path/to/repo",
-  "will_edit_filepaths": ["src/Program.cs"],
-  "dirty_files": {
-    "src/Program.cs": "file content before AI edit"
-  }
-}
-```
-
-#### agent-v1: AiAgent (after_edit)
-
-```json
-{
-  "type": "ai_agent",
-  "repo_working_dir": "/path/to/repo",
-  "edited_filepaths": ["src/Program.cs"],
-  "agent_name": "github-copilot-visualstudio",
-  "model": "unknown",
-  "conversation_id": "1717000000000",
-  "dirty_files": {
-    "src/Program.cs": "file content after AI edit"
-  }
-}
-```
-
-#### known_human
-
-```json
-{
-  "editor": "visualstudio",
-  "editor_version": "17.10.0",
-  "extension_version": "0.1.0",
-  "cwd": "/path/to/repo",
-  "edited_filepaths": ["src/Program.cs"],
-  "dirty_files": {
-    "src/Program.cs": "file content at save time"
-  }
-}
-```
+These match the Rust `AgentV1Payload` enum and `KnownHumanPreset` exactly. Uses `System.Text.Json` with `[JsonPropertyName]` attributes for snake_case serialization.
 
 ---
 
@@ -492,30 +248,13 @@ These match the Rust `AgentV1Payload` enum (from `agent_v1.rs`) and `KnownHumanP
 
 **File**: `src/mdm/agents/visual_studio.rs`
 
-A new `HookInstaller` implementation that auto-detects Visual Studio installations and installs the VSIX extension.
+A `HookInstaller` implementation that auto-detects Visual Studio installations using `vswhere.exe` and checks for the VSIX extension.
 
-**Detection**: Use `vswhere.exe` (ships with Visual Studio at `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe`) to enumerate installed VS instances:
-
-```
-vswhere.exe -all -format json -property installationPath,installationVersion
-```
-
-**Extension install**: Use `VSIXInstaller.exe` (found at `<VS install path>\Common7\IDE\VSIXInstaller.exe`):
-
-```
-VSIXInstaller.exe /quiet /admin GitAiVS.vsix
-```
-
-**Check if installed**: Look for the extension in VS's private extension directory:
-```
-%LOCALAPPDATA%\Microsoft\VisualStudio\17.0_<instance>\Extensions\
-```
-
-**Registration**: Add to `get_all_installers()` in `src/mdm/agents/mod.rs`.
+**Status**: Detection and check logic implemented. VSIX auto-install is stubbed (falls back to marketplace URL). Full auto-install depends on marketplace publishing.
 
 ### 5.2 Platform scope
 
-The `VisualStudioInstaller` is **Windows-only**. Visual Studio for Mac has been discontinued. The installer should return `tool_installed: false` on non-Windows platforms.
+The `VisualStudioInstaller` is **Windows-only**. Returns `tool_installed: false` on non-Windows platforms.
 
 ---
 
@@ -527,81 +266,44 @@ agent-support/visualstudio/
 ├── README.md                          # Build/debug/test instructions
 ├── GitAiVS.sln                        # Solution file
 └── src/
-    └── GitAiVS/
-        ├── GitAiVS.csproj             # Project file (targets net48, VS 2022+)
-        ├── source.extension.vsixmanifest
-        ├── GitAiPackage.cs
-        ├── Services/
-        │   ├── BinaryResolver.cs
-        │   ├── GitRepoResolver.cs
-        │   └── CheckpointService.cs
-        ├── Detection/
-        │   ├── CopilotEditDetector.cs
-        │   └── TabCompletionFilter.cs
-        ├── Listeners/
-        │   ├── TextBufferListener.cs
-        │   └── DocumentSaveListener.cs
-        └── Models/
-            └── CheckpointInput.cs
+    ├── GitAiVS/
+    │   ├── GitAiVS.csproj             # Project file (targets net48, VS 2022+)
+    │   ├── source.extension.vsixmanifest
+    │   ├── LICENSE
+    │   ├── GitAiPackage.cs
+    │   ├── Services/
+    │   │   ├── BinaryResolver.cs
+    │   │   ├── GitRepoResolver.cs
+    │   │   └── CheckpointService.cs
+    │   ├── Detection/
+    │   │   └── CopilotEditDetector.cs
+    │   ├── Listeners/
+    │   │   ├── TextBufferListener.cs
+    │   │   └── DocumentSaveListener.cs
+    │   └── Models/
+    │       └── CheckpointInput.cs
+    └── GitAiVS.Tests/
+        ├── GitAiVS.Tests.csproj
+        ├── BinaryResolverTests.cs
+        ├── GitRepoResolverTests.cs
+        ├── CheckpointInputTests.cs
+        └── DocumentSaveListenerTests.cs
 ```
 
 ---
 
-## 7. Open questions and risks
+## 7. Testing strategy
 
-### 7.1 Stack trace pattern discovery
+### 7.1 Unit tests
 
-The exact namespace prefixes for GitHub Copilot's Visual Studio extension are not publicly documented. We need an empirical discovery phase:
+Pure function tests that don't require a VS host (following IntelliJ's `VfsRefreshListenerTest.kt` pattern):
 
-1. Install the extension with verbose stack trace logging enabled
-2. Accept Copilot inline suggestions and chat edits
-3. Capture and catalog the stack frame class names
-4. Update `CopilotEditDetector.KnownAgents` with the discovered patterns
+- `BinaryResolverTests`: `ParseVersion` with valid/invalid/prerelease/garbage strings
+- `GitRepoResolverTests`: `ToRelativePath` with case variants, path separators, non-matching prefixes
+- `CheckpointInputTests`: JSON serialization schema compliance, null field omission
+- `DocumentSaveListenerTests`: `IsInternalPath` filtering logic
 
-**Mitigation**: The extension includes a debug logging mode (similar to IntelliJ's `logDocumentChange`) that dumps full stack traces to the VS output window. This allows pattern discovery without rebuilding.
-
-### 7.2 Thread model assumptions
-
-We assume Copilot edits fire `ITextBuffer.Changed` on the UI thread with a visible stack trace. If Copilot uses `ITextBuffer.CreateEdit()` from a background thread and marshals to the UI thread via `Dispatcher.Invoke`, the Copilot frames may be lost. In that case, we would fall back to the `TabCompletionFilter` heuristic for inline completions and would need an alternative approach for chat edits.
-
-**Mitigation**: If stack trace analysis proves unreliable, we can explore:
-- Monitoring Copilot's `ITextBufferEdit` tags/properties
-- Watching for Copilot-specific `ITextVersion` metadata
-- Using DTE automation events (`TextDocumentKeyPressEvents`)
-
-### 7.3 VS Marketplace publishing
-
-Publishing a VSIX to the Visual Studio Marketplace requires:
-- A Visual Studio Marketplace publisher account
-- Code signing certificate (recommended but not required)
-- Extension icon and metadata
-
-This is a one-time setup cost handled outside the PR.
-
-### 7.4 Performance
-
-Stack trace capture (`new StackTrace()`) is not free. On every keystroke, we capture a stack trace. In IntelliJ, this has not been a measurable performance issue because:
-- Stack traces are shallow (typically < 50 frames)
-- The JVM has optimized `Thread.getStackTrace()`
-
-In .NET, `Environment.StackTrace` (or `new StackTrace()`) is similarly lightweight. However, we should benchmark this in Visual Studio with large solutions to confirm there is no perceptible typing lag.
-
-**Mitigation**: If performance is an issue, we can:
-- Only capture stack traces when `ITextBuffer.Changed` has characteristics suggesting non-human input (e.g., large insertions, multi-line changes)
-- Sample stack traces (e.g., only every 3rd change event)
-
----
-
-## 8. Testing strategy
-
-### 8.1 Unit tests
-
-- `CopilotEditDetector`: Test with synthetic stack traces containing various combinations of Copilot and non-Copilot frames. Verify confidence levels and agent name extraction.
-- `BinaryResolver`: Test search order with mocked file system paths.
-- `CheckpointInput` serialization: Verify JSON output matches the expected schemas.
-- `GitRepoResolver`: Test with nested directories, repos with worktrees, and non-repo paths.
-
-### 8.2 Integration tests
+### 7.2 Integration tests (manual)
 
 - Install the extension in VS 2022 with Copilot enabled
 - Accept inline suggestions and verify `agent-v1` checkpoints are created
@@ -610,13 +312,22 @@ In .NET, `Environment.StackTrace` (or `new StackTrace()`) is similarly lightweig
 - Run `git ai status` to confirm attribution is recorded
 - Run `git ai log` after committing to verify notes are attached
 
-### 8.3 Manual QA checklist
+---
 
-- [ ] Extension activates on solution open
-- [ ] Info bar shown if git-ai is not installed
-- [ ] No typing lag with extension enabled in a large solution
-- [ ] Correct checkpoint preset (`agent-v1`) used for all events
-- [ ] Debouncing works (rapid edits produce single checkpoint)
-- [ ] Extension handles git-ai binary not on PATH gracefully
-- [ ] Extension handles git-ai process timeout gracefully
+## 8. Known limitations and future work
 
+### Implemented in v0.1.0
+
+- Stack trace detection for GitHub Copilot (inline + chat)
+- Human before_edit / AI after_edit checkpoint pairs
+- known_human checkpoints on save
+- Rust `VisualStudioInstaller` for detection
+
+### Planned for future versions
+
+- **VfsRefreshListener equivalent**: A `FileSystemWatcher`-based listener to catch disk-based AI edits (e.g., agents that apply patches via file writes). IntelliJ has this; VS does not yet.
+- **TabCompletionFilter**: An `IOleCommandTarget` that intercepts Tab key presses as a supplementary signal for inline completion detection. Was prototyped but removed from v0.1.0 as stack trace analysis proved sufficient. Can be re-added if edge cases require it.
+- **Info bar notification**: `IVsInfoBarUIFactory` to show a visible UI notification when git-ai is not installed.
+- **Telemetry**: PostHog + Sentry integration, matching IntelliJ's `TelemetryService`.
+- **VSIX auto-install**: Full `install_vsix()` implementation in the Rust installer.
+- **Additional AI agents**: Extend `KnownAgents` in `CopilotEditDetector` for future VS AI tools.

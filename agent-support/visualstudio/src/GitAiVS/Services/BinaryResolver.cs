@@ -10,12 +10,18 @@ namespace GitAiVS.Services
     ///   1. %USERPROFILE%\.git-ai\bin\git-ai.exe  (production install)
     ///   2. %USERPROFILE%\.git-ai-local-dev\gitwrap\bin\git-ai.exe  (nix dev)
     ///   3. PATH lookup via "where git-ai"
+    ///
+    /// Modeled after IntelliJ's GitAiService.findGitAiBinary().
     /// </summary>
     public sealed class BinaryResolver
     {
         private static readonly Version MinVersion = new(1, 0, 23);
+        private const int VersionCheckTimeoutMs = 5000;
+        private const int PathLookupTimeoutMs = 5000;
+
         private string? _cachedPath;
         private Version? _cachedVersion;
+        private string[]? _lastSearchedPaths;
 
         public string? ResolvedPath => _cachedPath;
         public Version? ResolvedVersion => _cachedVersion;
@@ -30,14 +36,30 @@ namespace GitAiVS.Services
 
             var path = FindBinary();
             if (path == null)
+            {
+                var searched = _lastSearchedPaths != null ? string.Join(", ", _lastSearchedPaths) : "(none)";
+                Trace.WriteLine("[git-ai] git-ai not found");
+                Trace.WriteLine($"[git-ai]   Searched locations: {searched}");
+                Trace.WriteLine("[git-ai]   To fix: Install git-ai from https://usegitai.com");
                 return null;
+            }
 
             var version = GetVersion(path);
-            if (version == null || version < MinVersion)
+            if (version == null)
+            {
+                Trace.WriteLine($"[git-ai] Could not determine git-ai version at {path}");
                 return null;
+            }
+
+            if (version < MinVersion)
+            {
+                Trace.WriteLine($"[git-ai] git-ai version {version} is below minimum required version {MinVersion}");
+                return null;
+            }
 
             _cachedPath = path;
             _cachedVersion = version;
+            Trace.WriteLine($"[git-ai] Found git-ai at {path} (version {version})");
             return path;
         }
 
@@ -47,13 +69,12 @@ namespace GitAiVS.Services
             _cachedVersion = null;
         }
 
-        private static string? FindBinary()
+        private string? FindBinary()
         {
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var isWindows = Environment.OSVersion.Platform == PlatformID.Win32NT;
-            var ext = isWindows ? ".exe" : "";
 
-            string[] knownPaths = isWindows
+            _lastSearchedPaths = isWindows
                 ? new[]
                 {
                     Path.Combine(home, ".git-ai", "bin", "git-ai.exe"),
@@ -65,12 +86,13 @@ namespace GitAiVS.Services
                     Path.Combine(home, ".git-ai-local-dev", "gitwrap", "bin", "git-ai"),
                 };
 
-            foreach (var candidate in knownPaths)
+            foreach (var candidate in _lastSearchedPaths)
             {
                 if (File.Exists(candidate))
                     return candidate;
             }
 
+            Trace.WriteLine("[git-ai] git-ai not found in known locations, trying PATH lookup");
             return TryPathLookup(isWindows);
         }
 
@@ -92,18 +114,21 @@ namespace GitAiVS.Services
                 if (proc == null) return null;
 
                 var output = proc.StandardOutput.ReadToEnd().Trim();
-                proc.WaitForExit(5000);
+                proc.WaitForExit(PathLookupTimeoutMs);
                 if (!proc.HasExited) { proc.Kill(); return null; }
 
                 if (proc.ExitCode != 0) return null;
 
                 var firstLine = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 if (firstLine.Length > 0 && File.Exists(firstLine[0]))
+                {
+                    Trace.WriteLine($"[git-ai] Found git-ai via PATH lookup: {firstLine[0]}");
                     return firstLine[0];
+                }
             }
             catch
             {
-                // PATH lookup is best-effort
+                Trace.WriteLine("[git-ai] PATH lookup for git-ai failed");
             }
 
             return null;
@@ -127,21 +152,36 @@ namespace GitAiVS.Services
                 if (proc == null) return null;
 
                 var output = proc.StandardOutput.ReadToEnd().Trim();
-                proc.WaitForExit(5000);
-                if (!proc.HasExited) { proc.Kill(); return null; }
-                if (proc.ExitCode != 0) return null;
+                var stderr = proc.StandardError.ReadToEnd().Trim();
+                proc.WaitForExit(VersionCheckTimeoutMs);
+
+                if (!proc.HasExited)
+                {
+                    proc.Kill();
+                    Trace.WriteLine("[git-ai] git-ai version check timed out");
+                    return null;
+                }
+
+                if (proc.ExitCode != 0)
+                {
+                    Trace.WriteLine($"[git-ai] git-ai version check failed");
+                    Trace.WriteLine($"[git-ai]   Exit code: {proc.ExitCode}");
+                    Trace.WriteLine($"[git-ai]   Stdout: {output}");
+                    Trace.WriteLine($"[git-ai]   Stderr: {stderr}");
+                    return null;
+                }
 
                 return ParseVersion(output);
             }
-            catch
+            catch (Exception ex)
             {
+                Trace.WriteLine($"[git-ai] git-ai version check error: {ex.Message}");
                 return null;
             }
         }
 
         internal static Version? ParseVersion(string versionString)
         {
-            // Expected: "1.0.39" or "1.0.39 (debug)"
             var part = versionString.Split(' ')[0];
             var segments = part.Split('.');
             if (segments.Length < 3) return null;

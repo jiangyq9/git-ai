@@ -14,17 +14,19 @@ namespace GitAiVS.Listeners
     /// Listens for document save events and fires known_human checkpoints.
     /// Debounces per workspace root (500ms) to batch multiple saves.
     /// Filters out Visual Studio internal paths (.vs/).
+    ///
+    /// Modeled after IntelliJ's DocumentSaveListener.kt.
     /// </summary>
     public sealed class DocumentSaveListener : IDisposable
     {
+        private const int DebounceMs = 500;
+
         private readonly CheckpointService _checkpointSvc;
         private readonly string _editorVersion;
         private readonly string _extensionVersion;
 
         private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingCheckpoints = new();
         private readonly ConcurrentDictionary<string, ConcurrentBag<string>> _pendingPaths = new();
-
-        private const int DebounceMs = 500;
 
         public DocumentSaveListener(CheckpointService checkpointSvc, string editorVersion, string extensionVersion)
         {
@@ -34,16 +36,20 @@ namespace GitAiVS.Listeners
         }
 
         /// <summary>
-        /// Called when a document is saved. Should be hooked to IVsRunningDocTableEvents.OnAfterSave
-        /// or equivalent VS event.
+        /// Called when a document is saved via IVsRunningDocTableEvents.OnAfterSave.
         /// </summary>
         public void OnDocumentSaved(string filePath)
         {
             if (IsInternalPath(filePath))
+            {
+                Trace.WriteLine($"[git-ai] [SAVE] Skipping internal path: {filePath}");
                 return;
+            }
 
             var workspaceRoot = GitRepoResolver.FindRepoRoot(filePath);
             if (workspaceRoot == null) return;
+
+            Trace.WriteLine($"[git-ai] [SAVE] Document saved: {Path.GetFileName(filePath)}");
 
             var bag = _pendingPaths.GetOrAdd(workspaceRoot, _ => new ConcurrentBag<string>());
             bag.Add(filePath);
@@ -90,23 +96,25 @@ namespace GitAiVS.Listeners
                 }
                 catch
                 {
-                    // File may be locked or inaccessible
+                    Trace.WriteLine($"[git-ai] [SAVE] Could not read file: {absolutePath}");
                 }
             }
 
             if (editedPaths.Count == 0) return;
 
-            Trace.WriteLine($"[git-ai] Firing known_human checkpoint for {editedPaths.Count} file(s)");
+            Trace.WriteLine($"[git-ai] [SAVE] Firing known_human checkpoint for {editedPaths.Count} file(s)");
 
+#pragma warning disable VSTHRD110
             _ = _checkpointSvc.SendKnownHumanAsync(
                 workspaceRoot,
                 _editorVersion,
                 _extensionVersion,
                 editedPaths,
                 dirtyFiles);
+#pragma warning restore VSTHRD110
         }
 
-        private static bool IsInternalPath(string path)
+        internal static bool IsInternalPath(string path)
         {
             return path.Contains($"{Path.DirectorySeparatorChar}.vs{Path.DirectorySeparatorChar}")
                 || path.Contains("/.vs/");

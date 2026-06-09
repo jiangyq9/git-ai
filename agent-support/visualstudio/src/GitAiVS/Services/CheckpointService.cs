@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using GitAiVS.Models;
@@ -7,10 +8,14 @@ namespace GitAiVS.Services
 {
     /// <summary>
     /// Spawns the git-ai CLI to create checkpoints.
-    /// All methods are fire-and-forget safe — they never throw.
+    /// All methods are fire-and-forget safe -- they never throw.
+    ///
+    /// Modeled after IntelliJ's GitAiService.kt checkpoint methods.
     /// </summary>
     public sealed class CheckpointService
     {
+        private const int CheckpointTimeoutMs = 30_000;
+
         private readonly BinaryResolver _resolver;
         private readonly string _sessionId;
 
@@ -31,47 +36,41 @@ namespace GitAiVS.Services
         /// <summary>
         /// Send a human (before_edit) checkpoint via agent-v1 preset.
         /// </summary>
-        public Task<bool> SendBeforeEditAsync(string repoRoot, string[] willEditPaths, System.Collections.Generic.Dictionary<string, string>? dirtyFiles)
+        public Task<bool> SendBeforeEditAsync(string repoRoot, string[] willEditPaths, Dictionary<string, string>? dirtyFiles)
         {
             var input = new HumanInput
             {
                 RepoWorkingDir = repoRoot,
-                WillEditFilepaths = new System.Collections.Generic.List<string>(willEditPaths),
+                WillEditFilepaths = new List<string>(willEditPaths),
                 DirtyFiles = dirtyFiles,
             };
 
-            return RunCheckpointAsync(
-                new[] { "checkpoint", "agent-v1", "--hook-input", "stdin" },
-                input.ToJson(),
-                repoRoot);
+            return RunCheckpointAsync("agent-v1", "human", input.ToJson(), repoRoot);
         }
 
         /// <summary>
         /// Send an AI agent (after_edit) checkpoint via agent-v1 preset.
         /// </summary>
-        public Task<bool> SendAfterEditAsync(string repoRoot, string[] editedPaths, string agentName, System.Collections.Generic.Dictionary<string, string>? dirtyFiles)
+        public Task<bool> SendAfterEditAsync(string repoRoot, string[] editedPaths, string agentName, Dictionary<string, string>? dirtyFiles)
         {
             var input = new AiAgentInput
             {
                 RepoWorkingDir = repoRoot,
-                EditedFilepaths = new System.Collections.Generic.List<string>(editedPaths),
+                EditedFilepaths = new List<string>(editedPaths),
                 AgentName = agentName,
                 Model = "unknown",
                 ConversationId = _sessionId,
                 DirtyFiles = dirtyFiles,
             };
 
-            return RunCheckpointAsync(
-                new[] { "checkpoint", "agent-v1", "--hook-input", "stdin" },
-                input.ToJson(),
-                repoRoot);
+            return RunCheckpointAsync("agent-v1", $"ai_agent ({agentName})", input.ToJson(), repoRoot);
         }
 
         /// <summary>
         /// Send a known_human checkpoint.
         /// </summary>
         public Task<bool> SendKnownHumanAsync(string repoRoot, string editorVersion, string extensionVersion,
-            System.Collections.Generic.List<string> editedPaths, System.Collections.Generic.Dictionary<string, string> dirtyFiles)
+            List<string> editedPaths, Dictionary<string, string> dirtyFiles)
         {
             var input = new KnownHumanInput
             {
@@ -83,24 +82,28 @@ namespace GitAiVS.Services
                 DirtyFiles = dirtyFiles,
             };
 
-            return RunCheckpointAsync(
-                new[] { "checkpoint", "known_human", "--hook-input", "stdin" },
-                input.ToJson(),
-                repoRoot);
+            return RunCheckpointAsync("known_human", "known_human", input.ToJson(), repoRoot);
         }
 
-        private async Task<bool> RunCheckpointAsync(string[] args, string stdinJson, string cwd)
+        private async Task<bool> RunCheckpointAsync(string preset, string inputType, string stdinJson, string cwd)
         {
             var binaryPath = _resolver.Resolve();
             if (binaryPath == null)
+            {
+                Trace.WriteLine("[git-ai] Skipping checkpoint -- git-ai not available");
                 return false;
+            }
 
             try
             {
+                var args = $"checkpoint {preset} --hook-input stdin";
+
+                Trace.WriteLine($"[git-ai] Creating checkpoint ({preset}): {inputType}");
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = binaryPath,
-                    Arguments = string.Join(" ", args),
+                    Arguments = args,
                     WorkingDirectory = cwd,
                     UseShellExecute = false,
                     RedirectStandardInput = true,
@@ -110,23 +113,45 @@ namespace GitAiVS.Services
                 };
 
                 using var proc = Process.Start(psi);
-                if (proc == null) return false;
+                if (proc == null)
+                {
+                    Trace.WriteLine("[git-ai] Failed to start git-ai process");
+                    return false;
+                }
 
                 await proc.StandardInput.WriteAsync(stdinJson);
                 proc.StandardInput.Close();
 
-                var completed = proc.WaitForExit(30_000);
+                var completed = proc.WaitForExit(CheckpointTimeoutMs);
                 if (!completed)
                 {
                     proc.Kill();
+                    Trace.WriteLine($"[git-ai] Checkpoint timed out after {CheckpointTimeoutMs}ms");
                     return false;
                 }
 
-                return proc.ExitCode == 0;
+                var stdout = proc.StandardOutput.ReadToEnd().Trim();
+                var stderr = proc.StandardError.ReadToEnd().Trim();
+
+                if (proc.ExitCode != 0)
+                {
+                    Trace.WriteLine($"[git-ai] Checkpoint failed");
+                    Trace.WriteLine($"[git-ai]   Command: {binaryPath} {args}");
+                    Trace.WriteLine($"[git-ai]   Exit code: {proc.ExitCode}");
+                    Trace.WriteLine($"[git-ai]   Stdout: {stdout}");
+                    Trace.WriteLine($"[git-ai]   Stderr: {stderr}");
+                    return false;
+                }
+
+                Trace.WriteLine($"[git-ai] Checkpoint created successfully ({inputType})");
+                if (stdout.Length > 0)
+                    Trace.WriteLine($"[git-ai]   Output: {stdout}");
+
+                return true;
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Trace.WriteLine($"[git-ai] Checkpoint error: {ex.Message}");
+                Trace.WriteLine($"[git-ai] Checkpoint error: {ex.Message}");
                 return false;
             }
         }
