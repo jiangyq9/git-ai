@@ -56,7 +56,7 @@ fn build_debug_report() -> String {
     let hardware_info = collect_hardware_info();
     let repository_info = collect_repository_info();
     let auth_info = collect_auth_status();
-    let env_overrides = collect_git_ai_env_overrides();
+    let git_environment = collect_git_environment();
 
     let mut out = String::new();
     let _ = writeln!(out, "git-ai debug report");
@@ -323,12 +323,15 @@ fn build_debug_report() -> String {
     }
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "== Git AI Environment ==");
-    if env_overrides.is_empty() {
-        let _ = writeln!(out, "No GIT_AI_* environment variables are set.");
+    let _ = writeln!(out, "== Git Environment ==");
+    if git_environment.is_empty() {
+        let _ = writeln!(
+            out,
+            "No GIT_AI_*, GITAI_*, or GIT_* environment variables are set."
+        );
     } else {
-        let _ = writeln!(out, "GIT_AI_* variables set:");
-        for entry in env_overrides {
+        let _ = writeln!(out, "GIT_AI_*, GITAI_*, and GIT_* variables set:");
+        for entry in git_environment {
             let _ = writeln!(out, "  {}", entry);
         }
     }
@@ -955,9 +958,17 @@ fn collect_git_ai_config_dump() -> Result<String, String> {
     Ok(out)
 }
 
-fn collect_git_ai_env_overrides() -> Vec<String> {
-    let mut entries: Vec<(String, String)> = env::vars()
-        .filter(|(k, _)| k.starts_with("GIT_AI_"))
+fn collect_git_environment() -> Vec<String> {
+    collect_git_environment_entries(env::vars())
+}
+
+fn collect_git_environment_entries<I>(entries: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut entries: Vec<(String, String)> = entries
+        .into_iter()
+        .filter(|(key, _)| is_debug_git_env_key(key))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -965,6 +976,10 @@ fn collect_git_ai_env_overrides() -> Vec<String> {
         .into_iter()
         .map(|(key, value)| format!("{}={}", key, redact_env_value(&key, &value)))
         .collect()
+}
+
+fn is_debug_git_env_key(key: &str) -> bool {
+    key.starts_with("GIT_AI_") || key.starts_with("GITAI_") || key.starts_with("GIT_")
 }
 
 fn redact_env_value(key: &str, value: &str) -> String {
@@ -1034,6 +1049,35 @@ mod tests {
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(1024), "1.00 KB (1024 bytes)");
+    }
+
+    #[test]
+    fn test_is_debug_git_env_key_matches_git_prefixes() {
+        assert!(is_debug_git_env_key("GIT_AI_DEBUG"));
+        assert!(is_debug_git_env_key("GITAI_TEST_DB_PATH"));
+        assert!(is_debug_git_env_key("GIT_DIR"));
+        assert!(is_debug_git_env_key("GIT_TRACE2_EVENT"));
+        assert!(!is_debug_git_env_key("GITHUB_TOKEN"));
+        assert!(!is_debug_git_env_key("PATH"));
+    }
+
+    #[test]
+    fn test_collect_git_environment_entries_sorts_and_redacts() {
+        let entries = collect_git_environment_entries(vec![
+            ("OTHER".to_string(), "ignored".to_string()),
+            ("GIT_DIR".to_string(), ".git".to_string()),
+            ("GITAI_TEST_DB_PATH".to_string(), "/tmp/db".to_string()),
+            ("GIT_AI_API_KEY".to_string(), "secret".to_string()),
+        ]);
+
+        assert_eq!(
+            entries,
+            vec![
+                "GITAI_TEST_DB_PATH=/tmp/db",
+                "GIT_AI_API_KEY=[REDACTED]",
+                "GIT_DIR=.git",
+            ]
+        );
     }
 
     #[test]
