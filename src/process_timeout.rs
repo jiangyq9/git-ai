@@ -63,12 +63,16 @@ pub(crate) fn run_command_with_timeout(
     cwd: Option<&Path>,
     timeout: Duration,
     poll_interval: Duration,
+    env_remove: &[&str],
 ) -> Result<TimedCommandOutput, String> {
     let mut command = Command::new(program);
     command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in env_remove {
+        command.env_remove(key);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

@@ -614,15 +614,21 @@ fn run_command_capture_with_timeout(
     timeout: Duration,
 ) -> Result<String, String> {
     let command = format_command_for_error(program, args);
-    let output =
-        run_command_with_timeout(program, args, None, timeout, DEBUG_COMMAND_POLL_INTERVAL)
-            .map_err(|e| {
-                format!(
-                    "failed to execute '{}': {}",
-                    program,
-                    strip_execute_prefix(&e)
-                )
-            })?;
+    let output = run_command_with_timeout(
+        program,
+        args,
+        None,
+        timeout,
+        DEBUG_COMMAND_POLL_INTERVAL,
+        &[],
+    )
+    .map_err(|e| {
+        format!(
+            "failed to execute '{}': {}",
+            program,
+            strip_execute_prefix(&e)
+        )
+    })?;
 
     if output.timed_out {
         return Err(format_timeout_capture_error(&command, timeout, output));

@@ -17,6 +17,12 @@ const SELF_CHECK_CONTENT_AI: &str = "Untracked line\nKnown human line\nAI line\n
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "10";
+const SELF_CHECK_TRACE_ENV_REMOVE: &[&str] = &[
+    "GIT_TRACE2_PARENT_SID",
+    "GIT_TRACE2_PARENT_NAME",
+    "GIT_AI_WRAPPER_INVOCATION_ID",
+    "GIT_TRACE2_ENV_VARS",
+];
 const DEBUG_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -513,7 +519,14 @@ fn run_logged_command_with_timeout(
 ) -> CommandRecord {
     let command = format_command(program, args);
     let cwd_display = cwd.map(|p| p.display().to_string());
-    match run_command_with_timeout(program, args, cwd, timeout, POLL_INTERVAL) {
+    match run_command_with_timeout(
+        program,
+        args,
+        cwd,
+        timeout,
+        POLL_INTERVAL,
+        SELF_CHECK_TRACE_ENV_REMOVE,
+    ) {
         Ok(output) => {
             let stderr = format_logged_stderr(
                 output.timed_out,
