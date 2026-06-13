@@ -1,4 +1,12 @@
-pub use super::refs_impl::*;
+pub use super::refs_impl::{
+    AI_AUTHORSHIP_FORK_TRACKING_REF, AI_AUTHORSHIP_FULL_REF, AI_AUTHORSHIP_PUSH_REFSPEC,
+    AI_AUTHORSHIP_REFNAME, CommitAuthorship, copy_ref, fallback_merge_notes_ours,
+    fanout_note_pathspec_for_commit, fanout_note_pathspec_for_ref, flat_note_pathspec_for_commit,
+    flat_note_pathspec_for_ref, get_authorship, get_commits_with_notes_from_list,
+    get_reference_as_authorship_log_v3, get_reference_as_working_log, grep_ai_notes,
+    merge_notes_from_ref, notes_path_for_object, parse_batch_check_blob_oid, ref_exists,
+    sanitize_remote_name, show_authorship_note, tracking_ref_for_remote,
+};
 
 use crate::error::GitAiError;
 use crate::git::refs_impl;
@@ -357,4 +365,22 @@ pub fn commits_with_authorship_notes(
     Ok(note_blob_oids_for_commits(repo, commit_shas)?
         .into_keys()
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_note_paths_for_object_includes_flat_two_and_three_level_paths() {
+        let oid = "abcdef1234567890abcdef1234567890abcdef12";
+        assert_eq!(
+            note_paths_for_object(oid),
+            vec![
+                "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+                "ab/cdef1234567890abcdef1234567890abcdef12".to_string(),
+                "ab/cd/ef1234567890abcdef1234567890abcdef12".to_string(),
+            ]
+        );
+    }
 }
