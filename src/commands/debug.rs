@@ -356,19 +356,48 @@ fn collect_git_diagnostics(configured_git: &str) -> Vec<GitDebugDiagnostics> {
         GitDiagnosticTarget::new("terminal git", "git"),
     ];
 
-    targets
+    let trace2_configs: Vec<_> = targets
+        .iter()
+        .map(crate::diagnostics::check_trace2_global_config)
+        .collect();
+    let attribution_handles: Vec<_> = targets
+        .clone()
         .into_iter()
         .map(|target| {
-            let trace2_config = crate::diagnostics::check_trace2_global_config(&target);
-            let attribution = crate::diagnostics::run_attribution_self_check(&target);
-            let trace2 = crate::diagnostics::run_trace2_file_self_check(&target);
-            GitDebugDiagnostics {
+            std::thread::spawn(move || crate::diagnostics::run_attribution_self_check(&target))
+        })
+        .collect();
+    let attributions: Vec<_> = attribution_handles
+        .into_iter()
+        .map(|handle| {
+            handle.join().unwrap_or_else(|_| {
+                DiagnosticCheckResult::failed(
+                    "attribution self-check failed",
+                    vec!["attribution self-check worker panicked".to_string()],
+                    Vec::new(),
+                )
+            })
+        })
+        .collect();
+    // Trace2 file checks temporarily rewrite global git config, so they must remain serialized.
+    let trace2_checks: Vec<_> = targets
+        .iter()
+        .map(crate::diagnostics::run_trace2_file_self_check)
+        .collect();
+
+    targets
+        .into_iter()
+        .zip(trace2_configs)
+        .zip(attributions)
+        .zip(trace2_checks)
+        .map(
+            |(((target, trace2_config), attribution), trace2)| GitDebugDiagnostics {
                 target,
                 trace2_config,
                 attribution,
                 trace2,
-            }
-        })
+            },
+        )
         .collect()
 }
 

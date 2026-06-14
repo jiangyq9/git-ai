@@ -1,11 +1,13 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::working_log::CheckpointKind;
+use crate::config::Config;
 use crate::daemon::control_api::{ControlRequest, FamilyStatus};
 use crate::diagnostic_sentinels::{
     DEBUG_SELF_CHECK_REMOTE_URL, debug_self_check_root, path_is_in_debug_self_check_root,
 };
+use crate::git::notes_api;
 use crate::git::repository::discover_repository_in_path_no_git_exec;
-use crate::process_timeout::run_command_with_timeout;
+use crate::process_timeout::run_command_with_timeout_with_env;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -24,6 +26,7 @@ const SELF_CHECK_TRACE_ENV_REMOVE: &[&str] = &[
     "GIT_AI_WRAPPER_INVOCATION_ID",
     "GIT_TRACE2_ENV_VARS",
 ];
+const SELF_CHECK_VALIDATION_TRACE_ENV_SET: &[(&str, &str)] = &[("GIT_TRACE2_EVENT", "0")];
 const DEBUG_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -83,7 +86,7 @@ impl DiagnosticCheckResult {
         }
     }
 
-    fn failed(
+    pub(crate) fn failed(
         summary: impl Into<String>,
         details: Vec<String>,
         commands: Vec<CommandRecord>,
@@ -401,10 +404,20 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
         .trim()
         .to_string();
 
-        let note = poll_authorship_note(&mut commands, &target.program, &repo_path, deadline)?;
+        let note = poll_authorship_note(
+            &mut commands,
+            &target.program,
+            &repo_path,
+            &commit_sha,
+            deadline,
+        )?;
         let mut details = validate_self_check_authorship_note(&note)?;
         details.insert(0, format!("repo: {}", repo_path.display()));
         details.insert(1, format!("commit: {}", commit_sha));
+        details.insert(
+            2,
+            format!("notes backend: {}", Config::get().notes_backend_kind()),
+        );
         Ok(details)
     })();
 
@@ -677,15 +690,26 @@ fn run_logged_command_with_timeout(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> CommandRecord {
+    run_logged_command_with_timeout_and_env(program, args, cwd, timeout, &[])
+}
+
+fn run_logged_command_with_timeout_and_env(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    env_set: &[(&str, &str)],
+) -> CommandRecord {
     let command = format_command(program, args);
     let cwd_display = cwd.map(|p| p.display().to_string());
-    match run_command_with_timeout(
+    match run_command_with_timeout_with_env(
         program,
         args,
         cwd,
         timeout,
         POLL_INTERVAL,
         SELF_CHECK_TRACE_ENV_REMOVE,
+        env_set,
     ) {
         Ok(output) => {
             let stderr = format_logged_stderr(
@@ -806,41 +830,40 @@ fn poll_authorship_note(
     commands: &mut Vec<CommandRecord>,
     git_program: &str,
     repo_path: &Path,
+    commit_sha: &str,
     deadline: Instant,
 ) -> Result<String, String> {
     let start = Instant::now();
-    let mut last_record = None;
+    let repo = discover_repository_in_path_no_git_exec(repo_path).map_err(|e| e.to_string())?;
+    let notes_backend = Config::get().notes_backend_kind();
 
     while Instant::now() < deadline {
-        let timeout = remaining_timeout(deadline);
-        if timeout.is_zero() {
-            break;
-        }
-        let record = run_logged_command_with_timeout(
-            git_program,
-            &["notes", "--ref=ai", "show", "HEAD"],
-            Some(repo_path),
-            timeout,
-        );
-        if record.success() && !record.stdout.trim().is_empty() {
-            let note = record.stdout.clone();
-            commands.push(record);
+        if let Some(note) = notes_api::read_note(&repo, commit_sha)
+            && !note.trim().is_empty()
+        {
             return Ok(note);
         }
-        let timed_out = record.timed_out;
-        last_record = Some(record);
-        if timed_out {
+
+        if remaining_timeout(deadline).is_zero() {
             break;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    if let Some(record) = last_record {
-        commands.push(record);
-    }
+    let diagnostic = run_logged_command_with_timeout_and_env(
+        git_program,
+        &["notes", "--ref=ai", "show", "HEAD"],
+        Some(repo_path),
+        remaining_timeout(deadline).max(POLL_INTERVAL),
+        SELF_CHECK_VALIDATION_TRACE_ENV_SET,
+    );
+    commands.push(diagnostic);
+
     Err(format!(
-        "timed out after {:.1}s waiting for authorship note on HEAD in {}",
+        "timed out after {:.1}s waiting for authorship note via {} backend for {} in {}",
         start.elapsed().as_secs_f64(),
+        notes_backend,
+        commit_sha,
         repo_path.display()
     ))
 }

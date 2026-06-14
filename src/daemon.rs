@@ -664,7 +664,7 @@ fn trace_invocation_is_definitely_read_only(
             // Only parse the subcommand for commands that need it; parsing is
             // cheap but this avoids it for the majority of clearly-read-only
             // commands like status, diff, show, etc.
-            let subcommand = if matches!(cmd, "stash" | "worktree") {
+            let subcommand = if matches!(cmd, "notes" | "stash" | "worktree") {
                 trace_argv_subcommand(argv)
             } else {
                 None
