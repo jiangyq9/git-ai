@@ -29,7 +29,7 @@ Those commands are not part of the current CLI surface. Prefer the supported com
 | Inspect line authorship for a file | `git-ai blame <file>` |
 | Inspect line authorship and prompt payloads for a range | `git-ai blame <file> -L <start>,<end> --show-prompt \| cat` |
 | Display one known prompt record | `git-ai show-prompt <prompt_id>` |
-| Explore commit history with notes | `git-ai log --notes=ai --oneline` |
+| Explore commit history with notes | `git-ai log --oneline` |
 
 ## Workflow patterns
 
