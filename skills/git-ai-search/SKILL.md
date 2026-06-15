@@ -9,6 +9,8 @@ allowed-tools: ["Bash(git-ai:*)", "Read", "Glob", "Grep"]
 
 Use this skill to inspect AI authorship metadata that Git AI has already attached to commits and lines. This version intentionally uses only commands that exist in the current CLI.
 
+The `git-ai-search` skill name is retained for backwards compatibility with existing skill invocations. Despite the name, this skill must not call the unsupported `git-ai search` command.
+
 ## Important CLI constraints
 
 Do not run these commands from this skill:
