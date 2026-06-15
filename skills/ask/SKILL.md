@@ -28,6 +28,17 @@ Answer questions about AI-written code by locating the relevant file and line ra
 
 3. Relay the answer to the user.
 
+## Subagent configuration
+
+The subagent gets only `Bash` and `Read`. It does not get `Glob`, `Grep`, or `Task`. Keep the subagent focused on one authorship lookup plus one code read.
+
+```text
+Task tool settings:
+  subagent_type: "general-purpose"
+  max_turns: 4
+  allowed tools: Bash, Read
+```
+
 ## Supported lookup command
 
 Use `git-ai blame --show-prompt`. Do not use `git-ai search`; it is not part of the current CLI.
@@ -42,7 +53,7 @@ git-ai blame src/commands/blame.rs --show-prompt | cat
 
 ## Subagent prompt template
 
-Fill in `{question}`, `{file_path}`, and `{start},{end}`. Omit the `-L` flag if no line range is available.
+When an exact line range is available, fill in `{question}`, `{file_path}`, `{start}`, and `{end}`:
 
 ```text
 You are answering a question about code by inspecting the available Git AI authorship context.
@@ -55,11 +66,10 @@ You have exactly 3 steps. Do them in order, then stop.
 
 STEP 1 - Authorship lookup:
   Run: git-ai blame {file_path} -L {start},{end} --show-prompt | cat
-  If the line range is not available, run: git-ai blame {file_path} --show-prompt | cat
   Do not run git-ai search, git-ai prompts, or any transcript-directory search.
 
 STEP 2 - Read the code:
-  Read {file_path}, focusing on the relevant lines.
+  Read {file_path}, focusing on lines {start}-{end}.
 
 STEP 3 - Answer:
   Use the prompt context from Step 1 when available. If no prompt context is found,
@@ -71,8 +81,19 @@ Format:
 - Evidence: file/line references and command output used
 ```
 
+When no exact line range is available, omit the `LINES:` field and use this lookup step instead:
+
+```text
+STEP 1 - Authorship lookup:
+  Run: git-ai blame {file_path} --show-prompt | cat
+  Do not run git-ai search, git-ai prompts, or any transcript-directory search.
+```
+
 ## Hard constraints
 
+- Subagents may use only `Bash` and `Read`.
+- Do not give subagents `Glob`, `Grep`, or `Task`.
+- Do not run more than one `git-ai blame` command unless the first command fails because the line range is invalid.
 - Do not use `git-ai search`.
 - Do not use `git-ai prompts`.
 - Do not read `.claude/`, `.cursor/`, `.agents/`, or agent log directories directly.
