@@ -587,7 +587,8 @@ impl MetricsDatabase {
                     WHEN delivered_ts IS NULL
                      AND attempts >= ?2 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN last_sync_error IS NOT NULL
+                    WHEN delivered_ts IS NULL
+                     AND last_sync_error IS NOT NULL
                      AND last_sync_error != '' THEN 1 ELSE 0 END), 0)
             FROM metrics
             "#,
@@ -610,7 +611,9 @@ impl MetricsDatabase {
             .conn
             .query_row(
                 "SELECT last_sync_error FROM metrics \
-                 WHERE last_sync_error IS NOT NULL AND last_sync_error != '' \
+                 WHERE delivered_ts IS NULL \
+                   AND last_sync_error IS NOT NULL \
+                   AND last_sync_error != '' \
                  ORDER BY COALESCE(last_sync_at, 0) DESC, id DESC \
                  LIMIT 1",
                 [],
@@ -1199,8 +1202,10 @@ mod tests {
         let (mut db, _temp_dir) = create_test_db();
         let now = unix_now();
 
-        db.insert_events_with_delivered_ts(&[event_json(days_ago(5))], Some(now))
+        let delivered_ids = db
+            .insert_events_with_delivered_ts(&[event_json(days_ago(5))], Some(now))
             .unwrap();
+        let delivered_id = delivered_ids[0];
         let ids = db
             .insert_events(&[
                 event_json(days_ago(4)),
@@ -1214,6 +1219,18 @@ mod tests {
         let processing_id = ids[2];
         let stopped_id = ids[3];
 
+        db.conn
+            .execute(
+                "UPDATE metrics \
+                 SET last_sync_error = ?1, last_sync_at = ?2 \
+                 WHERE id = ?3",
+                params![
+                    "delivered retry recovered",
+                    now.saturating_add(60) as i64,
+                    delivered_id
+                ],
+            )
+            .unwrap();
         db.conn
             .execute(
                 "UPDATE metrics \

@@ -41,7 +41,7 @@ pub fn handle_whoami(args: &[String]) {
         )
     );
 
-    if !api_client.has_api_key() && !api_client.is_logged_in() {
+    if should_exit_failure(&auth, &api_ctx) {
         std::process::exit(1);
     }
 }
@@ -178,6 +178,10 @@ fn api_access_status(auth: &AuthStatus, api_ctx: &ApiContext, api_client: &ApiCl
             }
         }
     }
+}
+
+fn should_exit_failure(auth: &AuthStatus, api_ctx: &ApiContext) -> bool {
+    api_ctx.api_key.is_none() && !matches!(auth.state, AuthState::LoggedIn)
 }
 
 fn author_identity_header_status(api_ctx: &ApiContext) -> String {
@@ -367,5 +371,22 @@ mod tests {
         assert!(output.contains("Events: 12 total, 8 delivered, 4 not delivered"));
         assert!(output.contains("Rows with sync errors: 1"));
         assert!(output.contains("Latest sync error: temporary outage"));
+    }
+
+    #[test]
+    fn should_exit_failure_matches_displayed_auth_state() {
+        let logged_out = auth_status(AuthState::LoggedOut);
+        let logged_in = auth_status(AuthState::LoggedIn);
+        let no_token_no_key = api_context(crate::config::DEFAULT_API_BASE_URL, None, None, None);
+        let no_token_with_key = api_context(
+            crate::config::DEFAULT_API_BASE_URL,
+            Some("gitai_test_1234567890"),
+            None,
+            Some("Alice Example <alice@example.com>"),
+        );
+
+        assert!(should_exit_failure(&logged_out, &no_token_no_key));
+        assert!(!should_exit_failure(&logged_out, &no_token_with_key));
+        assert!(!should_exit_failure(&logged_in, &no_token_no_key));
     }
 }
